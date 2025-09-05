@@ -65,9 +65,11 @@ def generate_response(query: str, passages: list) -> str:
     2.  **Use the Evidence:** Base your answer *strictly* on the provided evidence text below. Do not use outside knowledge.
     3.  **Produce Four Sections in Your Output:**
         * **Short Answer:** A brief, 2-4 sentence summary answering the user's question directly.
-        * **ComplianceRisk:** Assess the risk as 'Low', 'Medium', or 'High' based *only* on the evidence. Provide a short reason (e.g., "Low Risk: Standard transaction with no red flags mentioned in the evidence.").
+        * **ComplianceRisk:** Assess the risk as 'Low', 'Medium', or 'High' based *only* on the evidence. Provide a short reason.
         * **ActionChecklist:** Create a list of 2-3 simple, actionable steps the user should take.
         * **Evidence Snippets:** Cite 1-2 direct quotes from the evidence that support your answer, along with their source document ID.
+    
+    **Formatting Rule:** Do NOT use markdown formatting like asterisks for bolding. Output in plain text.
 
     ---
     **Evidence:**
@@ -79,44 +81,56 @@ def generate_response(query: str, passages: list) -> str:
     try:
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         response = model.generate_content(prompt)
-        return response.text
+        # Clean up any residual markdown
+        return response.text.replace('**', '')
     except Exception as e:
         st.error(f"An error occurred while generating the response: {e}")
         return "Sorry, I was unable to generate a response. Please try again."
 
 def apply_deterministic_rules(query: str) -> (str, str):
     """
-    Applies robust, explainable rules to identify clear high-risk scenarios.
-    This function now uses regex to reliably parse monetary values.
+    Applies robust, explainable rules to identify clear high-risk scenarios
+    based on the latest Indian financial regulations.
     """
     risk = "Low"
     reasons = []
     query_lower = query.lower()
     
-    # Rule 1: High-value transactions (Threshold: ₹10,00,000)
-    # This regex finds numbers with commas, and also words like "lakh" or "crore"
     money_pattern = r'₹?\s*([\d,]+(?:\.\d+)?)\s*(lakh|lac|crore)?'
     matches = re.findall(money_pattern, query_lower)
     
+    # Extract the highest numerical value mentioned in the query
+    max_amount = 0
     for amount_str, unit in matches:
         amount = float(amount_str.replace(',', ''))
         if unit.lower() in ['lakh', 'lac']:
             amount *= 100000
         elif unit.lower() == 'crore':
             amount *= 10000000
-        
-        if amount >= 1000000:
-            risk = "High"
-            reasons.append(f"Transaction amount (₹{amount:,.0f}) exceeds the ₹10 lakh reporting threshold.")
-            break # Stop after first high-value match
+        if amount > max_amount:
+            max_amount = amount
 
-    # Rule 2: Crypto transfers - Expanded keywords
+    # Rule 1: High-value cash/equivalent transactions (Threshold: ₹10,00,000)
+    if max_amount >= 1000000:
+        risk = "High"
+        reasons.append(f"Transaction amount (₹{max_amount:,.0f}) exceeds the ₹10 lakh reporting threshold for single transactions.")
+
+    # Rule 2: Cross-border wire transfers (Threshold: ₹5,00,000)
+    cross_border_keywords = ["international", "abroad", "overseas", "cross-border", "wire transfer", "remittance", "singapore", "usa", "uk"]
+    if any(keyword in query_lower for keyword in cross_border_keywords) and max_amount > 500000:
+        risk = "High"
+        reasons.append(f"Cross-border wire transfer (₹{max_amount:,.0f}) exceeds the ₹5 lakh reporting threshold.")
+
+    # Rule 3: Crypto transfers - High risk regardless of amount
     crypto_keywords = ["crypto", "virtual asset", "bitcoin", "ethereum", "vda", "nft"]
     if any(keyword in query_lower for keyword in crypto_keywords):
         risk = "High"
-        reasons.append("Involves crypto/virtual asset transfer, which has specific reporting requirements.")
+        reasons.append("Involves crypto/virtual asset transfer, which has specific reporting requirements under PMLA.")
 
-    return risk, " ".join(reasons) if reasons else "No high-risk keywords detected."
+    # Remove duplicate reasons if any
+    unique_reasons = list(dict.fromkeys(reasons))
+    return risk, " ".join(unique_reasons) if unique_reasons else "No high-risk keywords or thresholds detected."
+
 
 def parse_llm_output(output_text: str) -> dict:
     """
@@ -125,7 +139,6 @@ def parse_llm_output(output_text: str) -> dict:
     """
     parsed_data = {}
     
-    # Use regex with re.DOTALL to handle multiline content
     patterns = {
         'answer': r"Short Answer:(.*?)(?=ComplianceRisk:|ActionChecklist:|Evidence Snippets:|$)",
         'risk': r"ComplianceRisk:(.*?)(?=ActionChecklist:|Evidence Snippets:|$)",
@@ -135,9 +148,9 @@ def parse_llm_output(output_text: str) -> dict:
     
     for key, pattern in patterns.items():
         match = re.search(pattern, output_text, re.IGNORECASE | re.DOTALL)
-        parsed_data[key] = match.group(1).strip() if match else "Not found."
+        # Clean up the text by removing asterisks and stripping whitespace
+        parsed_data[key] = match.group(1).replace('**', '').strip() if match else "Not found."
 
-    # Extract just the risk level (High, Medium, Low)
     risk_text = parsed_data.get('risk', '')
     if 'high' in risk_text.lower():
         parsed_data['risk_level'] = 'High'
@@ -153,7 +166,6 @@ def parse_llm_output(output_text: str) -> dict:
 st.title("RAFAI: Regulatory-Aware Financial Advisor 🇮🇳")
 st.caption("Your AI assistant for navigating Indian financial regulations. Powered by Google Gemini.")
 
-# --- Load index and initialize chat history ---
 index, chunks = load_faiss_index()
 
 if "messages" not in st.session_state:
@@ -164,6 +176,8 @@ with st.sidebar:
     st.header("Ask a Compliance Question")
     default_question = "I want to transfer 20,00,000 to a crypto exchange in Singapore. Do I need to report this?"
     user_query = st.text_area("Your Question:", default_question, height=120, key="user_query_input")
+    
+    spinner_placeholder = st.empty()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -173,35 +187,25 @@ with st.sidebar:
             elif index is None:
                 st.error("Cannot proceed, index is not loaded.")
             else:
-                with st.spinner("Analyzing regulations... This may take a moment."):
-                    # 1. Add user query to chat
+                with spinner_placeholder, st.spinner("Analyzing regulations..."):
                     st.session_state.messages.append({"role": "user", "content": user_query})
-
-                    # 2. Embed query and retrieve passages
                     query_embedding = get_query_embedding(user_query)
                     top_passages = retrieve_top_passages(query_embedding, index, chunks)
-                    
-                    # 3. Generate response from Gemini
                     llm_response_text = generate_response(user_query, top_passages)
                     parsed_llm_response = parse_llm_output(llm_response_text)
-
-                    # 4. Apply deterministic rules for an explainable risk layer
                     rule_risk, rule_reason = apply_deterministic_rules(user_query)
-
-                    # 5. Determine final risk (deterministic rule takes precedence)
                     llm_risk_level = parsed_llm_response.get('risk_level', 'Low')
                     final_risk = rule_risk if rule_risk == "High" else llm_risk_level
-
-                    # 6. Refine checklist for high-risk scenarios
+                    
                     final_checklist = parsed_llm_response.get('checklist', 'No checklist provided.')
                     if final_risk == "High":
                         high_risk_actions = [
-                            "**Critical:** Submit a Cash Transaction Report (CTR) or Suspicious Transaction Report (STR) to the FIU-IND.",
-                            "**Critical:** Immediately notify your bank’s designated compliance officer of this transaction."
+                            "Critical: Submit a mandatory report (e.g., CTR, STR) to the FIU-IND.",
+                            "Critical: Immediately notify your bank’s designated compliance officer of this transaction."
                         ]
+                        # Prepend high-risk actions to the checklist
                         final_checklist = "\n".join(high_risk_actions) + "\n" + final_checklist
-
-                    # 7. Store everything in the session state for the assistant's message
+                    
                     assistant_message = {
                         "role": "assistant",
                         "content": parsed_llm_response.get('answer'),
@@ -217,7 +221,7 @@ with st.sidebar:
                     st.session_state.messages.append(assistant_message)
     
     with col2:
-        if st.button("Clear Chat", use_container_width=True):
+        if st.button("Clear History", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
 
@@ -225,59 +229,68 @@ with st.sidebar:
     st.caption("Disclaimer: This is an informational demo and not legal or financial advice. Always consult a qualified professional.")
 
 
-# --- Main Chat Interface ---
+# --- Main Dashboard Interface ---
 if not st.session_state.messages:
-    st.info("Ask a question in the sidebar to get started!")
+    st.info("Ask a question in the sidebar to get started and see the analysis here!")
+else:
+    # Get the last user message and the last assistant message
+    last_user_msg = next((msg for msg in reversed(st.session_state.messages) if msg["role"] == "user"), None)
+    last_asst_msg = next((msg for msg in reversed(st.session_state.messages) if msg["role"] == "assistant"), None)
 
-for i, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    if not last_user_msg or not last_asst_msg:
+        st.warning("Could not find the last interaction. Please ask a new question.")
+        st.stop()
 
-        # For assistant messages, display the detailed analysis
-        if message["role"] == "assistant":
-            
-            # Display Final Risk prominently
-            final_risk = message.get("final_risk", "N/A")
-            if final_risk == "High":
-                st.error(f"**Final Risk Level: {final_risk}**", icon="🚨")
-            elif final_risk == "Medium":
-                st.warning(f"**Final Risk Level: {final_risk}**", icon="⚠️")
-            else:
-                st.success(f"**Final Risk Level: {final_risk}**", icon="✅")
 
-            # FIX: Using st.radio as a robust alternative to st.tabs to resolve potential TypeError
-            selected_tab = st.radio(
-                "Select a category to view details",
-                options=["Action Checklist", "Compliance Analysis", "Retrieved Evidence"],
-                key=f"radio_tabs_{i}",
-                horizontal=True,
-                label_visibility="collapsed"
-            )
+    col1, col2 = st.columns([0.6, 0.4])
 
-            if selected_tab == "Action Checklist":
-                st.markdown(message.get("checklist", "No checklist available."))
-                st.download_button(
-                    label="⬇️ Download Checklist",
-                    data=message.get("checklist", "").encode('utf-8'),
-                    file_name=f"ActionChecklist_{i}.txt",
-                    mime="text/plain",
-                    key=f"download_{i}"
-                )
+    with col1:
+        st.subheader("Your Question")
+        st.info(last_user_msg['content'])
+        
+        st.subheader("RAFAI's Advice")
+        with st.container(border=True):
+             st.markdown(last_asst_msg['content'])
+             st.divider()
+             st.markdown(last_asst_msg.get("snippets", "No snippets available."))
 
-            elif selected_tab == "Compliance Analysis":
-                st.subheader("How this risk was determined:")
-                st.markdown(f"**1. Deterministic Rule Check:** `{message.get('rule_risk')}`")
-                st.caption(f"Reason: {message.get('rule_reason')}")
-                st.markdown(f"**2. AI Model Assessment:** `{message.get('llm_risk')}`")
-                st.caption(f"Reason: {message.get('llm_risk_reason')}")
-                
-            elif selected_tab == "Retrieved Evidence":
-                st.subheader("Evidence used for this response:")
-                for p_idx, p in enumerate(message.get("evidence", [])):
-                    # FIX: Removed the 'key' argument which was causing a TypeError in some Streamlit versions
-                    with st.expander(f"Source: `{p.get('doc_id', 'Unknown')}`"):
-                        st.markdown(f"> {p.get('text', 'Content not available.')}")
-                        source_url = p.get('source_url')
-                        if source_url:
-                            st.markdown(f"**Original URL:** [{source_url}]({source_url})")
+    with col2:
+        st.subheader("Compliance Analysis")
+        final_risk = last_asst_msg.get("final_risk", "N/A")
+        if final_risk == "High":
+            st.error(f"**Risk Level: {final_risk}**", icon="🚨")
+        elif final_risk == "Medium":
+            st.warning(f"**Risk Level: {final_risk}**", icon="⚠️")
+        else:
+            st.success(f"**Risk Level: {final_risk}**", icon="✅")
+        
+        primary_reason = last_asst_msg.get('rule_reason') if last_asst_msg.get('rule_risk') == 'High' else last_asst_msg.get('llm_risk_reason')
+        st.caption(f"**Reason:** {primary_reason}")
+        st.divider()
+
+        st.markdown("**Action Checklist**")
+        checklist_text = last_asst_msg.get("checklist", "No checklist available.")
+        st.markdown(checklist_text)
+        st.download_button(
+            label="⬇️ Download Checklist",
+            data=checklist_text.encode('utf-8'),
+            file_name="ActionChecklist.txt",
+            mime="text/plain",
+        )
+        st.divider()
+
+        with st.expander("Show Compliance Breakdown"):
+            st.markdown(f"**1. Deterministic Rule Check:** `{last_asst_msg.get('rule_risk')}`")
+            st.caption(f"Details: {last_asst_msg.get('rule_reason')}")
+            st.markdown(f"**2. AI Model Assessment:** `{last_asst_msg.get('llm_risk')}`")
+            st.caption(f"Details: {last_asst_msg.get('llm_risk_reason')}")
+
+        with st.expander("Show Retrieved Evidence & Provenance"):
+            for p in last_asst_msg.get("evidence", []):
+                st.markdown(f"**Source:** `{p.get('doc_id', 'Unknown')}`")
+                st.markdown(f"> {p.get('text', 'Content not available.')}")
+                source_url = p.get('source_url')
+                if source_url:
+                    st.markdown(f"**Original URL:** [{source_url}]({source_url})")
+                st.markdown("---")
 
