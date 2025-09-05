@@ -15,7 +15,6 @@ except:
 
 
 # --- RAG AND GENERATION LOGIC ---
-
 def get_query_embedding(query):
     """Generates an embedding for the user's query."""
     result = genai.embed_content(model="models/text-embedding-004", content=query)
@@ -35,19 +34,17 @@ def generate_response(query, passages):
 
     # The prompt template has been updated to fix the SyntaxError
     prompt = f"""
-    You are RAFAI, a regulatory-aware financial assistant. Use ONLY the evidence passages below to answer the user.
-    Follow these 4 tasks precisely:
+    You are RAFAI, a regulatory-aware financial assistant.
+    Important rule: DO NOT alter numbers or amounts from the user’s question. Repeat them exactly as given.
+
+    Tasks:
     1) Provide a short answer (2-4 sentences).
-    2.1) Cite up to 2 relevant evidence snippets from the passages.
-    
-    # --- THIS IS THE CORRECTED LINE ---
-    2.2) For each snippet, include the document ID as a citation like ``. 
-    
-    3) Output a 'ComplianceRisk' score (Low, Medium, or High) with a one-line reason.
-    4) Output an 'ActionChecklist' with up to 3 short, actionable tasks (who, what, when).
+    2) Cite up to 2 relevant evidence snippets (with doc IDs).
+    3) Output a 'ComplianceRisk' (Low, Medium, High) with reason.
+    4) Output an 'ActionChecklist' with up to 3 short tasks.
 
     ---
-    Evidence Passages:
+    Evidence:
     {evidence_text}
     ---
     User Question: {query}
@@ -60,26 +57,48 @@ def generate_response(query, passages):
     return response.text
 
 # --- DETERMINISTIC RISK RULES ---
-def apply_deterministic_rules(query, llm_output):
-    """Applies simple, explainable rules to assign a final risk score."""
-    risk = "Low" # Default risk
+def apply_deterministic_rules(query):
+    """Applies explainable rules to assign a risk score."""
+    risk = "Low"
     reasons = []
 
-    # Rule 1: Transaction Amount [cite: 84]
-    if "20 lakh" in query or "20,00,000" in query:
+    # Rule 1: High-value transactions
+    if "20 lakh" in query or "20,00,000" in query or "10,00,000" in query:
         risk = "High"
-        reasons.append("Transaction amount (20 Lakh) exceeds the 10 Lakh INR reporting threshold.")
-    
-    # Rule 2: Crypto Keyword [cite: 85]
+        reasons.append("Transaction exceeds the ₹10 lakh reporting threshold.")
+
+    # Rule 2: Crypto transfers
     if "crypto" in query.lower():
         risk = "High"
-        reasons.append("Involves cross-border crypto transfer, which requires mandatory reporting.")
-    
+        reasons.append("Involves crypto transfer, which requires mandatory reporting.")
+
     return risk, " ".join(reasons)
 
+# --- LLM RISK ---
+def extract_llm_risk(output_text):
+    """Parse the Gemini response to extract ComplianceRisk."""
+    for line in output_text.splitlines():
+        if "ComplianceRisk" in line:
+            if "High" in line:
+                return "High"
+            elif "Medium" in line:
+                return "Medium"
+            elif "Low" in line:
+                return "Low"
+    return "Unknown"
 
-# --- STREAMLIT UI SETUP --- [cite: 88, 89]
+# --- REDINE CHECKLIST ---
+def refine_checklist(llm_output, final_risk):
+    checklist_text = llm_output.split("ActionChecklist:")[-1].strip()
+    tasks = checklist_text.split("\n")
 
+    if final_risk == "High":
+        tasks.insert(0, "Submit CTR to FIU-IND within 7 days.")
+        tasks.insert(1, "Notify your bank’s compliance officer immediately.")
+    return "\n".join(tasks)
+
+
+# --- STREAMLIT UI SETUP ---
 st.set_page_config(page_title="RAFAI Demo", layout="wide")
 st.title("RAFAI: Regulatory-Aware Financial Advisor 🇮🇳")
 
@@ -106,7 +125,7 @@ else:
     # Main chat interface
     st.sidebar.header("Ask a Compliance Question")
     
-    # Use the example question from the document as a placeholder [cite: 106]
+    # Use the example question from the document as a placeholder
     default_question = "I want to transfer 20,00,000 to a crypto exchange in Singapore. Do I need to report?"
     user_query = st.sidebar.text_area("Your Question:", default_question, height=100)
     
@@ -122,8 +141,14 @@ else:
                 # 3. Generate a response from Gemini
                 llm_response_text = generate_response(user_query, top_passages)
 
-                # 4. Apply deterministic rules for final risk score [cite: 87]
-                final_risk, risk_reason = apply_deterministic_rules(user_query, llm_response_text)
+                # 4. Extract LLM risk
+                llm_risk = extract_llm_risk(llm_response_text)
+
+                # 5. Apply deterministic rules
+                rule_risk, risk_reason = apply_deterministic_rules(user_query)
+
+                # 6. Final risk = deterministic takes precedence
+                final_risk = rule_risk if rule_risk != "Low" else llm_risk
 
                 # Store and display conversation
                 st.session_state.messages.append({"role": "user", "content": user_query})
@@ -151,19 +176,21 @@ else:
 
         with col2:
             st.subheader("Compliance Analysis")
+
+            st.markdown(f"**LLM Assessment:** {llm_risk}")
+            st.markdown(f"**Deterministic Rule Risk:** {rule_risk}")
             
-            # Compliance Risk Gauge [cite: 89]
-            if last_asst_msg['risk'] == "High":
-                st.error(f"**Risk Level: {last_asst_msg['risk']}**")
-            elif last_asst_msg['risk'] == "Medium":
-                st.warning(f"**Risk Level: {last_asst_msg['risk']}**")
+            if final_risk == "High":
+                st.error(f"**Final Risk Level: {final_risk}**")
+            elif final_risk == "Medium":
+                st.warning(f"**Final Risk Level: {final_risk}**")
             else:
-                st.success(f"**Risk Level: {last_asst_msg['risk']}**")
-            
-            st.caption(f"**Reason:** {last_asst_msg['reason']}")
-            
-            # Action Checklist Download [cite: 89]
-            checklist_text = last_asst_msg['content'].split("ActionChecklist:")[-1].strip()
+                st.success(f"**Final Risk Level: {final_risk}**")
+
+            st.caption(f"**Reason:** {risk_reason if risk_reason else 'Based on evidence interpretation.'}")
+
+            # Action Checklist Download
+            checklist_text = refine_checklist(llm_response_text, final_risk)
             st.download_button(
                 label="⬇️ Download Action Checklist",
                 data=checklist_text,
