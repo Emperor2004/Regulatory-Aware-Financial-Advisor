@@ -1,2 +1,5 @@
 .env
 rafai_venv/
+scraped_data.json
+chunks_data.pkl
+vector_index.faiss
