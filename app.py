@@ -180,4 +180,4 @@ else:
                     st.divider()
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Disclaimer: This is an informational demo and not legal/financial advice[cite: 96].")
+st.sidebar.caption("Disclaimer: This is an informational demo and not legal/financial advice.")
