@@ -1,4 +1,3 @@
-import os
 import faiss
 import pickle
 import json
@@ -6,10 +5,11 @@ import google.generativeai as genai
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 import numpy as np
+import streamlit as st
 
-load_dotenv()
 # Configure the Gemini API client
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+load_dotenv()
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 def get_text_chunks_from_json(filepath="scraped_data.json"):
     """Loads scraped data and splits it into chunks."""
