@@ -55,7 +55,7 @@ def generate_response(query, passages):
     """
     
     # Call Gemini API
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     response = model.generate_content(prompt)
     return response.text
 
@@ -86,12 +86,30 @@ st.title("RAFAI: Regulatory-Aware Financial Advisor 🇮🇳")
 # Load the FAISS index and chunk data once
 @st.cache_resource
 def load_index():
+    import subprocess
+
+    # If index/chunks not found, auto-run scraper + build_index
+    if not (os.path.exists("vector_index.faiss") and os.path.exists("chunks_data.pkl")):
+        st.warning("Index files not found. Running scraper and build_index...")
+
+        try:
+            # Run scraper.py
+            subprocess.run(["python", "scraper.py"], check=True)
+
+            # Run build_index.py
+            subprocess.run(["python", "build_index.py"], check=True)
+        except Exception as e:
+            st.error(f"Failed to build index automatically: {e}")
+            return None, None
+
+    # After ensuring files exist, load them
     try:
         index = faiss.read_index("vector_index.faiss")
         with open("chunks_data.pkl", "rb") as f:
             chunks = pickle.load(f)
         return index, chunks
-    except FileNotFoundError:
+    except Exception as e:
+        st.error(f"Error loading index: {e}")
         return None, None
 
 index, chunks = load_index()
